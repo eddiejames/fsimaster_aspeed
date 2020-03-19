@@ -105,7 +105,7 @@ int fsi_master_aspeed_read(void *mem, unsigned long reg, unsigned long *val)
 	if (status & OPB_STATUS_ERR_ACK)
 		return -EIO;
 
-	*val = read32(mem, OPB0_FSI_DATA_R);
+	*val = be32toh(read32(mem, OPB0_FSI_DATA_R));
 
 	return 0;
 }
@@ -118,7 +118,7 @@ int fsi_master_aspeed_write(void *mem, unsigned long reg, unsigned long val)
 	write32(mem, OPB0_RW, CMD_WRITE);
 	write32(mem, OPB0_XFER_SIZE, XFER_FULLWORD);
 	write32(mem, OPB0_FSI_ADDR, reg + FSI_MASTER_ASPEED_ADDR);
-	write32(mem, OPB0_FSI_DATA_W, val);
+	write32(mem, OPB0_FSI_DATA_W, htobe32(val));
 	write32(mem, OPB_IRQ_CLEAR, 1);
 	write32(mem, OPB_TRIGGER, 1);
 
