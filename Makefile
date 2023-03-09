@@ -1,5 +1,5 @@
 all:
-	$(CC) fsimaster_aspeed.c -o fsimaster-aspeed
+	$(CC) -Wall -std=c17 fsimaster_aspeed.c -o fsimaster-aspeed
 
 .PHONY: clean
 clean:
