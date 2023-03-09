@@ -49,6 +49,39 @@
 
 #define XFER_FULLWORD		0x00000003
 
+struct reg {
+	const char *name;
+	uint32_t reg;
+};
+
+static const struct reg mfsi_regs[] = {
+	{ "MMODE", 0x000 },
+	{ "MDLYR", 0x004 },
+	{ "MCRSP0", 0x008 },
+	{ "MENP0", 0x010 },
+	{ "MLEVP0", 0x018 },
+	{ "MREFP0", 0x020 },
+	{ "MHPMP0", 0x028 },
+	{ "MSIEP0", 0x030 },
+	{ "MAESP0", 0x050 },
+	{ "MAEB", 0x070 },
+	{ "MVER", 0x074 },
+	{ "MBSYP0", 0x078 },
+	{ "MSTAP0", 0x0d0 },
+	{ "MSTAP1", 0x0d4 },
+	{ "MSTAP2", 0x0d8 },
+	{ "MSTAP3", 0x0dc },
+	{ "MSTAP4", 0x0e0 },
+	{ "MSTAP5", 0x0e4 },
+	{ "MSTAP6", 0x0e8 },
+	{ "MSTAP7", 0x0ec },
+	{ "MESRB0", 0x1d0 },
+	{ "MSCSB0", 0x1d4 },
+	{ "MATRB0", 0x1d8 },
+	{ "MDTRB0", 0x1dc },
+	{ "MECTRL", 0x2e0 }
+};
+
 static int verbose = 0;
 
 #define vprintf(...)			\
@@ -188,6 +221,7 @@ void help()
 	printf("\tModes:\n");
 	printf("\t\taspeed\tread/write Aspeed FSI register space\n");
 	printf("\t\tcfam\tread/write cfam address space\n");
+	printf("\t\tdump\tread all registers of address space\n");
 	printf("\t\tmaster\tread/write FSI master space\n");
 	printf("\tOptions:\n");
 	printf("\t\t-n --num_words <count>\tnumber of words to read/write\n");
@@ -196,6 +230,7 @@ void help()
 
 int main(int argc, char **argv)
 {
+	const struct reg *regs = NULL;
 	volatile uint32_t *mem;
 	uint32_t _data = 0;
 	uint32_t *data = &_data;
@@ -204,6 +239,7 @@ int main(int argc, char **argv)
 	uint32_t reg = 0;
 	uint32_t i = 1;
 	int write = 0;
+	int dump = 0;
 	int fd;
 	int rc;
 
@@ -252,6 +288,8 @@ int main(int argc, char **argv)
 
 	if (!strncmp(argv[i], "cfam", 4)) {
 		base = FSI_MASTER_ASPEED_ADDR;
+	} else if (!strncmp(argv[i], "dump", 4)) {
+		dump = 1;
 	} else if (!strncmp(argv[i], "master", 6)) {
 		base = FSI_MASTER_ASPEED_CTRL_ADDR;
 	} else if (strncmp(argv[i], "aspeed", 6)) {
@@ -261,34 +299,46 @@ int main(int argc, char **argv)
 
 	++i;
 	if (i >= argc) {
-		printf("No register specified.\n");
+		printf("No register%s specified.\n", dump ? " space" : "");
 		return -EINVAL;
 	}
-	rc = arg_to_u32(argv[i], &reg);
-	if (rc)
-		return rc;
 
-	++i;
-	if (i < argc) {
-		uint32_t j;
-
-		if (words > 1) {
-			data = malloc(words * sizeof(uint32_t));
-			if (!data)
-				return -ENOMEM;
-
-			memset(data, 0, words * sizeof(uint32_t));
+	if (dump) {
+		if (!strncmp(argv[i], "master", 6)) {
+			base = FSI_MASTER_ASPEED_CTRL_ADDR;
+			words = sizeof(mfsi_regs) / sizeof(mfsi_regs[0]);
+			regs = mfsi_regs;
+		} else {
+			printf("Unknown register space: %s\n", argv[i]);
+			return -EINVAL;
 		}
+	} else {
+		rc = arg_to_u32(argv[i], &reg);
+		if (rc)
+			return rc;
 
-		for (j = 0; j < words && i < argc; ++j) {
-			rc = arg_to_u32(argv[i++], &data[j]);
-			if (rc)
-				goto done;
+		++i;
+		if (i < argc) {
+			uint32_t j;
 
-			vprintf("data[%u]:%08x\n", j, data[j]);
+			if (words > 1) {
+				data = malloc(words * sizeof(uint32_t));
+				if (!data)
+					return -ENOMEM;
+
+				memset(data, 0, words * sizeof(uint32_t));
+			}
+
+			for (j = 0; j < words && i < argc; ++j) {
+				rc = arg_to_u32(argv[i++], &data[j]);
+				if (rc)
+					goto done;
+
+				vprintf("data[%u]:%08x\n", j, data[j]);
+			}
+
+			write = 1;
 		}
-
-		write = 1;
 	}
 
 	fd = open("/dev/mem", O_RDWR);
@@ -305,28 +355,38 @@ int main(int argc, char **argv)
 		goto done;
 	}
 
-	if (base == 0)
-		reg /= 4;
+	if (dump) {
+		for (i = 0; i < words; ++i) {
+			rc = fsi_master_aspeed_read(mem, base + regs[i].reg, data);
+			if (rc)
+				goto done;
 
-	for (i = 0; i < words; ++i) {
-		if (write) {
-			if (base == 0) {
-				atomic_store(&mem[reg + i], data[i]);
-			} else {
-				rc = fsi_master_aspeed_write(mem, base + reg + (i * 4), data[i]);
-				if (rc)
-					goto done;
-			}
-		} else {
-			if (base == 0) {
-				data[0] = atomic_load(&mem[reg + i]);
-				printf("FSIM%02x: %08x\n", reg + i, data[0]);
-			} else {
-				rc = fsi_master_aspeed_read(mem, base + reg + (i * 4), &data[0]);
-				if (rc)
-					goto done;
+			printf("%s[%03x]: %08x\n", regs[i].name, regs[i].reg, data[0]);
+		}
+	} else {
+		if (base == 0)
+			reg /= 4;
 
-				printf("%s%02x: %08x\n", base == FSI_MASTER_ASPEED_ADDR ? "CFAM" : "MFSI", reg + (i * 4), data[0]);
+		for (i = 0; i < words; ++i) {
+			if (write) {
+				if (base == 0) {
+					atomic_store(&mem[reg + i], data[i]);
+				} else {
+					rc = fsi_master_aspeed_write(mem, base + reg + (i * 4), data[i]);
+					if (rc)
+						goto done;
+				}
+			} else {
+				if (base == 0) {
+					data[0] = atomic_load(&mem[reg + i]);
+					printf("FSIM%03x: %08x\n", reg + i, data[0]);
+				} else {
+					rc = fsi_master_aspeed_read(mem, base + reg + (i * 4), data);
+					if (rc)
+						goto done;
+
+					printf("%s%03x: %08x\n", base == FSI_MASTER_ASPEED_ADDR ? "CFAM" : "MFSI", reg + (i * 4), data[0]);
+				}
 			}
 		}
 	}
