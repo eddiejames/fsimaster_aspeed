@@ -43,6 +43,8 @@
 
 #define XFER_FULLWORD		0x00000003
 
+static int verbose = 0;
+
 void diff_timespec(const struct timespec *start, const struct timespec *end,
 		   struct timespec *diff)
 {
@@ -135,12 +137,18 @@ int fsi_master_aspeed_write(void *mem, unsigned long reg, unsigned long val)
 
 void help()
 {
-	printf("Usage: fsimaster-aspeed <register> (optional <value>)\n");
+	printf("Usage: fsimaster-aspeed (options) <register> (optional <value>)\n");
+	printf("\tOptions:\n");
+	printf("\t\t-v --verbose\n");
+	printf("\t\t-d --dump\n");
 }
 
 int main(int argc, char **argv)
 {
 	int fd;
+	int rc = 0;
+	int idx = 1;
+	int dump = 0;
 	void *mem;
 	unsigned long reg;
 	unsigned long val;
@@ -150,11 +158,30 @@ int main(int argc, char **argv)
 		return -EINVAL;
 	}
 
-	errno = 0;
-	reg = strtoul(argv[1], NULL, 0);
-	if (errno) {
-		printf("Failed to parse register %s\n", argv[1]);
-		return -EINVAL;
+	if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+		help();
+		return 0;
+	}
+
+	if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--verbose")) {
+		if (argc < 3) {
+			help();
+			return -EINVAL;
+		}
+
+		idx++;
+		verbose = 1;
+	}
+
+	if (!strcmp(argv[idx], "-d") || !strcmp(argv[idx], "--dump")) {
+		dump = 1;
+	} else {
+		errno = 0;
+		reg = strtoul(argv[idx], NULL, 0);
+		if (errno) {
+			printf("Failed to parse register %s\n", argv[idx]);
+			return -EINVAL;
+		}
 	}
 
 	fd = open("/dev/mem", O_RDWR);
@@ -171,22 +198,30 @@ int main(int argc, char **argv)
 		return -ENODEV;
 	}
 
-	if (argc > 2) {
+	if (dump) {
+		for (unsigned long i = 0; i < 0xec; i += 4)
+			printf("FSIM%02lx: %08lx\n", i, read32(mem, i));
+
+		return 0;
+	}
+
+	if (argc > idx + 1) {
 		errno = 0;
-		val = strtoul(argv[2], NULL, 0);
+		val = strtoul(argv[idx + 1], NULL, 0);
 
 		if (errno) {
-			printf("Failed to parse value %s\n", argv[2]);
+			printf("Failed to parse value %s\n", argv[idx + 1]);
 			return -EINVAL;
 		}
 
-		fsi_master_aspeed_write(mem, reg, val);
+		rc = fsi_master_aspeed_write(mem, reg, val);
 	}
 	else {
-		fsi_master_aspeed_read(mem, reg, &val);
+		rc = fsi_master_aspeed_read(mem, reg, &val);
 
-		printf("0x%08x\n", val);
+		if (!rc)
+			printf("0x%08lx\n", val);
 	}
 
-	return 0;
+	return rc;
 }
