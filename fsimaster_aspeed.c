@@ -244,7 +244,6 @@ int fsi_master_aspeed_xfer_ackd(volatile uint32_t *mem)
 		++i;
 	} while (!(status & bit));
 
-	write32(mem, OPB_IRQ_STATUS, bit);
 	return 0;
 }
 
@@ -256,7 +255,7 @@ int fsi_master_aspeed_read(volatile uint32_t *mem, uint32_t reg, uint32_t *val)
 	write32(mem, opb1 ? OPB1_RW : OPB0_RW, CMD_READ);
 	write32(mem, opb1 ? OPB1_XFER_SIZE : OPB0_XFER_SIZE, XFER_FULLWORD);
 	write32(mem, opb1 ? OPB1_FSI_ADDR : OPB0_FSI_ADDR, reg);
-	write32(mem, OPB_IRQ_STATUS, 0);
+	write32(mem, OPB_IRQ_CLEAR, 1);
 	write32(mem, OPB_TRIGGER, 1);
 
 	rc = fsi_master_aspeed_xfer_ackd(mem);
@@ -283,7 +282,7 @@ int fsi_master_aspeed_write(volatile uint32_t *mem, uint32_t reg, uint32_t val)
 	write32(mem, opb1 ? OPB1_XFER_SIZE : OPB0_XFER_SIZE, XFER_FULLWORD);
 	write32(mem, opb1 ? OPB1_FSI_ADDR : OPB0_FSI_ADDR, reg);
 	write32(mem, opb1 ? OPB1_FSI_DATA_W : OPB0_FSI_DATA_W, htobe32(val));
-	write32(mem, OPB_IRQ_STATUS, 0);
+	write32(mem, OPB_IRQ_CLEAR, 1);
 	write32(mem, OPB_TRIGGER, 1);
 
 	rc = fsi_master_aspeed_xfer_ackd(mem);
