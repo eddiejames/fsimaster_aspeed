@@ -46,6 +46,7 @@
 #define OPB0_XFER_SIZE		0x18
 #define OPB0_FSI_ADDR		0x1c
 #define OPB0_FSI_DATA_W		0x20
+#define OPB1_DMA_ENABLE		0x24
 #define OPB1_SELECT		0x28
 #define OPB1_RW			0x2c
 #define OPB1_XFER_SIZE		0x30
@@ -56,6 +57,7 @@
 #define OPB_IRQ_STATUS		0x48
 #define  OPB0_XFER_ACK_EN 	 0x00010000
 #define  OPB1_XFER_ACK_EN	 0x00020000
+#define  OPB_DMA_IRQ_EN		 0xffff
 #define OPB1_WRITE_ORDER1	0x54
 #define OPB1_WRITE_ORDER2	0x58
 #define OPB1_READ_ORDER		0x60
@@ -65,6 +67,9 @@
 #define OPB0_FSI_DATA_R		0x84
 #define OPB1_STATUS		0x8c
 #define OPB1_FSI_DATA_R		0x90
+#define DMA_CHAN0_ADDR		0xc4
+#define DMA_CHAN0_CTRL		0xc8
+#define DMA_FUNC_EN		0xe4
 
 #define REG(x)			((x) / sizeof(uint32_t))
 
@@ -72,6 +77,12 @@
 #define CMD_WRITE		0
 
 #define XFER_FULLWORD		0x00000003
+
+enum {
+	SPACE_ASPEED = 0,
+	SPACE_MASTER,
+	SPACE_CFAM,
+};
 
 struct reg {
 	const char *name;
@@ -163,8 +174,9 @@ static const struct reg mfsi_regs[] = {
 #ifdef __aarch64__
 static int dma = 0;
 #endif
-static int opb1 = 0;
 static int verbose = 0;
+static int page_size = 0;
+static int irq_enabled = 0;
 
 #define vprintf(...)			\
 ({					\
@@ -221,7 +233,7 @@ int fsi_master_aspeed_xfer_ackd(volatile uint32_t *mem)
 	struct timespec slp;
 	struct timespec start;
 	uint32_t status;
-	const uint32_t bit = opb1 ? OPB1_XFER_ACK_EN : OPB0_XFER_ACK_EN;
+	int rc = 0;
 	int i = 0;
 
 	slp.tv_sec = 0;
@@ -232,19 +244,27 @@ int fsi_master_aspeed_xfer_ackd(volatile uint32_t *mem)
 		if (i)
 			nanosleep(&slp, &rem);
 
-		status = read32(mem, OPB_IRQ_STATUS);
+		status = atomic_load(&mem[REG(OPB_IRQ_STATUS)]);
 
 		timespec_get(&end, TIME_UTC);
 		diff_timespec(&start, &end, &df);
 		if (df.tv_sec > 0) {
-			printf("Timed out status:%08x [%d]\n", status, i);
-			return -ETIMEDOUT;
+			uint32_t opb_status = read32(mem, OPB0_STATUS);
+
+			printf("Timed out irq status:%08x opb status:%08x [%d]\n", status,
+				opb_status, i);
+			rc = -ETIMEDOUT;
+			goto done;
 		}
 
 		++i;
-	} while (!(status & bit));
+	} while (!(status & OPB0_XFER_ACK_EN));
 
-	return 0;
+	vprintf("read32[%02x]:%08x\n", OPB_IRQ_STATUS, status);
+done:
+	if (irq_enabled)
+		write32(mem, OPB_IRQ_STATUS, OPB0_XFER_ACK_EN);
+	return rc;
 }
 
 int fsi_master_aspeed_read(volatile uint32_t *mem, uint32_t reg, uint32_t *val)
@@ -252,23 +272,26 @@ int fsi_master_aspeed_read(volatile uint32_t *mem, uint32_t reg, uint32_t *val)
 	int rc;
 	uint32_t status;
 
-	write32(mem, opb1 ? OPB1_RW : OPB0_RW, CMD_READ);
-	write32(mem, opb1 ? OPB1_XFER_SIZE : OPB0_XFER_SIZE, XFER_FULLWORD);
-	write32(mem, opb1 ? OPB1_FSI_ADDR : OPB0_FSI_ADDR, reg);
-	write32(mem, OPB_IRQ_CLEAR, 1);
+	write32(mem, OPB0_RW, CMD_READ);
+	write32(mem, OPB0_XFER_SIZE, XFER_FULLWORD);
+	write32(mem, OPB0_FSI_ADDR, reg);
+	if (irq_enabled)
+		write32(mem, OPB_IRQ_STATUS, 0);
+	else
+		write32(mem, OPB_IRQ_CLEAR, 1);
 	write32(mem, OPB_TRIGGER, 1);
 
 	rc = fsi_master_aspeed_xfer_ackd(mem);
 	if (rc)
 		return rc;
 
-	status = read32(mem, opb1 ? OPB1_STATUS : OPB0_STATUS);
+	status = read32(mem, OPB0_STATUS);
 	if (status & OPB_STATUS_ERR_ACK) {
 		printf("OPB read error status:%08x\n", status);
 		return -EIO;
 	}
 
-	*val = be32toh(read32(mem, opb1 ? OPB1_FSI_DATA_R : OPB0_FSI_DATA_R));
+	*val = be32toh(read32(mem, OPB0_FSI_DATA_R));
 
 	return 0;
 }
@@ -278,18 +301,21 @@ int fsi_master_aspeed_write(volatile uint32_t *mem, uint32_t reg, uint32_t val)
 	int rc;
 	uint32_t status;
 
-	write32(mem, opb1 ? OPB1_RW : OPB0_RW, CMD_WRITE);
-	write32(mem, opb1 ? OPB1_XFER_SIZE : OPB0_XFER_SIZE, XFER_FULLWORD);
-	write32(mem, opb1 ? OPB1_FSI_ADDR : OPB0_FSI_ADDR, reg);
-	write32(mem, opb1 ? OPB1_FSI_DATA_W : OPB0_FSI_DATA_W, htobe32(val));
-	write32(mem, OPB_IRQ_CLEAR, 1);
+	write32(mem, OPB0_RW, CMD_WRITE);
+	write32(mem, OPB0_XFER_SIZE, XFER_FULLWORD);
+	write32(mem, OPB0_FSI_ADDR, reg);
+	write32(mem, OPB0_FSI_DATA_W, htobe32(val));
+	if (irq_enabled)
+		write32(mem, OPB_IRQ_STATUS, 0);
+	else
+		write32(mem, OPB_IRQ_CLEAR, 1);
 	write32(mem, OPB_TRIGGER, 1);
 
 	rc = fsi_master_aspeed_xfer_ackd(mem);
 	if (rc)
 		return rc;
 
-	status = read32(mem, opb1 ? OPB1_STATUS : OPB0_STATUS);
+	status = read32(mem, OPB0_STATUS);
 	if (status & OPB_STATUS_ERR_ACK) {
 		printf("OPB write error status:%08x\n", status);
 		return -EIO;
@@ -298,8 +324,29 @@ int fsi_master_aspeed_write(volatile uint32_t *mem, uint32_t reg, uint32_t val)
 	return 0;
 }
 
+int fsi_slave_reset_errors(volatile uint32_t *mem, uint32_t link)
+{
+	uint32_t sstat;
+	uint32_t sisc;
+	int rc;
+
+	rc = fsi_master_aspeed_read(mem, FSI_MASTER_ASPEED_ADDR + (link * 0x80000) + 0x808, &sisc);
+	if (rc)
+		return rc;
+
+	rc = fsi_master_aspeed_read(mem, FSI_MASTER_ASPEED_ADDR + (link * 0x80000) + 0x814,
+				    &sstat);
+	if (rc)
+		return rc;
+
+	printf("link:%u SISC[008]: %08x SSTAT[014]: %08x\n", link, sisc, sstat);
+
+	return fsi_master_aspeed_write(mem, FSI_MASTER_ASPEED_ADDR + (link * 0x80000) + 0x834,
+				       0x40000000);
+}
+
 #ifdef __aarch64__
-int check_errors(volatile uint32_t *ctrl)
+int dma_check_errors(volatile uint32_t *ctrl, volatile uint32_t *mem, uint32_t link)
 {
 	uint32_t mesrb = read32(ctrl, 0x1d0);
 
@@ -312,6 +359,10 @@ int check_errors(volatile uint32_t *ctrl)
 		write32(ctrl, 0, mmode & 0x5fffffff);
 		write32(ctrl, 0xd0, 0x20000000);
 		write32(ctrl, 0, mmode);
+
+		mesrb &= 0xf0000000;
+		if (mesrb == 0x90000000 || mesrb == 0xa0000000)
+			fsi_slave_reset_errors(mem, link);
 
 		return -EIO;
 	}
@@ -330,6 +381,51 @@ void dma_link_enable(volatile uint32_t *ctrl, uint32_t link)
 	}
 }
 #endif
+
+int check_errors(volatile uint32_t *mem, uint32_t link)
+{
+	uint32_t mesrb;
+	int rc;
+
+	rc = fsi_master_aspeed_read(mem, FSI_MASTER_ASPEED_CTRL_ADDR + 0x1d0, &mesrb);
+	if (rc)
+		return rc;
+
+	if (mesrb & 0xf0000000) {
+		uint32_t mmode;
+		uint32_t mstap;
+
+		rc = fsi_master_aspeed_read(mem, FSI_MASTER_ASPEED_CTRL_ADDR, &mmode);
+		if (rc)
+			return rc;
+
+		rc = fsi_master_aspeed_read(mem, FSI_MASTER_ASPEED_CTRL_ADDR + 0xd0, &mstap);
+		if (rc)
+			return rc;
+
+		printf("MESRB0[1d0]: %08x MSTAP0[0d0]: %08x\n", mesrb, mstap);
+
+		rc = fsi_master_aspeed_write(mem, FSI_MASTER_ASPEED_CTRL_ADDR, mmode & 0x5fffffff);
+		if (rc)
+			return rc;
+
+		rc = fsi_master_aspeed_write(mem, FSI_MASTER_ASPEED_CTRL_ADDR + 0xd0, 0x20000000);
+		if (rc)
+			return rc;
+
+		rc = fsi_master_aspeed_write(mem, FSI_MASTER_ASPEED_CTRL_ADDR, mmode);
+		if (rc)
+			return rc;
+
+		mesrb &= 0xf0000000;
+		if (mesrb == 0x90000000 || mesrb == 0xa0000000)
+			fsi_slave_reset_errors(mem, link);
+
+		return -EIO;
+	}
+
+	return 0;
+}
 
 int link_enable(volatile uint32_t *mem, uint32_t link)
 {
@@ -365,7 +461,6 @@ void help()
 	printf("\t\t-d --dma\n");
 #endif
 	printf("\t\t-l --link <link>\tFSI link to access\n");
-	printf("\t\t-o --opb1\n");
 	printf("\t\t-n --num_words <count>\tnumber of words to read/write\n");
 	printf("\t\t-v --verbose\n");
 }
@@ -380,15 +475,19 @@ int main(int argc, char **argv)
 #endif
 	uint32_t _data = 0;
 	uint32_t *data = &_data;
+	uint32_t opbrc = 0;
 	uint32_t words = 1;
 	uint32_t link = 0;
 	uint32_t base = 0;
 	uint32_t reg = 0;
 	uint32_t i = 1;
+	int space = SPACE_ASPEED;
 	int write = 0;
 	int dump = 0;
 	int fd;
 	int rc;
+
+	page_size = getpagesize();
 
 	if (argc < 2) {
 		help();
@@ -433,16 +532,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!strncmp(argv[i], "-o", 2) || !strncmp(argv[i], "--opb1", 6)) {
-		++i;
-		if (i >= argc) {
-			help();
-			return -EINVAL;
-		}
-
-		opb1 = 1;
-	}
-
 #ifdef __aarch64__
 	if (!strncmp(argv[i], "-d", 2) || !strncmp(argv[i], "--dma", 5)) {
 		++i;
@@ -475,10 +564,12 @@ int main(int argc, char **argv)
 
 	if (!strncmp(argv[i], "cfam", 4)) {
 		base = FSI_MASTER_ASPEED_ADDR;
+		space = SPACE_CFAM;
 	} else if (!strncmp(argv[i], "dump", 4)) {
 		dump = 1;
 	} else if (!strncmp(argv[i], "master", 6)) {
 		base = FSI_MASTER_ASPEED_CTRL_ADDR;
+		space = SPACE_MASTER;
 	} else if (strncmp(argv[i], "aspeed", 6)) {
 		help();
 		return -EINVAL;
@@ -493,6 +584,7 @@ int main(int argc, char **argv)
 	if (dump) {
 		if (!strncmp(argv[i], "master", 6)) {
 			base = FSI_MASTER_ASPEED_CTRL_ADDR;
+			space = SPACE_MASTER;
 			words = sizeof(mfsi_regs) / sizeof(mfsi_regs[0]);
 			regs = mfsi_regs;
 		} else if (!strncmp(argv[i], "aspeed", 5)) {
@@ -538,50 +630,51 @@ int main(int argc, char **argv)
 		goto done;
 	}
 
-	mem = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_MASTER_BASE);
+	mem = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_MASTER_BASE);
 	if (mem == MAP_FAILED) {
 		printf("Failed to mmap: %d - %s\n", errno, strerror(errno));
 		rc = -ENODEV;
 		goto done;
 	}
 
+	opbrc = read32(mem, OPB_RETRY_COUNTER);
+
+	if (opbrc & 0x10000)
+		irq_enabled = 1;
+
 #ifdef __aarch64__
 	if (dma) {
-		if (base) {
-			ctrl = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_CONTROL_BASE);
+		if (space != SPACE_ASPEED) {
+			ctrl = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+				    FSI_CONTROL_BASE);
 			if (!ctrl) {
-				printf("Failed to mmap FSI master: %d - %s\n", errno, strerror(errno));
+				printf("Failed to mmap FSI master: %d - %s\n", errno,
+				       strerror(errno));
 				rc = -ENODEV;
 				goto done;
 			}
 
-			if (base == FSI_MASTER_ASPEED_ADDR) {
-				fsi = mmap(NULL, 14336, PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_BASE + (link * 0x80000));
+			if (space == SPACE_CFAM) {
+				fsi = mmap(NULL, 14336, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+					   FSI_BASE + (link * 0x80000));
 				if (!fsi) {
-					printf("Failed to mmap FSI: %d - %s\n", errno, strerror(errno));
+					printf("Failed to mmap FSI: %d - %s\n", errno,
+					       strerror(errno));
 					rc = -ENODEV;
 					goto done;
 				}
 			}
 		}
 
-		write32(mem, OPB_RETRY_COUNTER, 0x00100010);
+		write32(mem, OPB_RETRY_COUNTER, opbrc & ~0x000c0000);
 		write32(mem, OPB_CTRL_BASE, FSI_CONTROL_BASE);
 		write32(mem, OPB_FSI_BASE, FSI_BASE);
 	}
 #endif
 
-	if (opb1) {
-		write32(mem, OPB1_READ_ORDER, 0x00030b1b);
-		write32(mem, OPB1_WRITE_ORDER1, 0x0011101b);
-		write32(mem, OPB1_WRITE_ORDER2, 0x0c330f3f);
-		write32(mem, OPB0_SELECT, 0);
-		write32(mem, OPB1_SELECT, 1);
-	}
-
 	if (dump) {
 		for (i = 0; i < words; ++i) {
-			if (base == 0) {
+			if (space == SPACE_ASPEED) {
 				data[0] = atomic_load(&mem[REG(regs[i].reg)]);
 			} else {
 #ifdef __aarch64__
@@ -600,7 +693,7 @@ int main(int argc, char **argv)
 			printf("%s[%03x]: %08x\n", regs[i].name, regs[i].reg, data[0]);
 		}
 	} else {
-		if (base == FSI_MASTER_ASPEED_ADDR) {
+		if (space == SPACE_CFAM) {
 #ifdef __aarch64__
 			if (dma)
 				dma_link_enable(ctrl, link);
@@ -609,6 +702,8 @@ int main(int argc, char **argv)
 			rc = link_enable(mem, link);
 			if (rc)
 				goto undo;
+
+			base += link * 0x80000;
 #ifdef __aarch64__
 			}
 #endif
@@ -616,14 +711,14 @@ int main(int argc, char **argv)
 
 		for (i = 0; i < words; ++i) {
 			if (write) {
-				if (base == 0) {
+				if (space == SPACE_ASPEED) {
 					atomic_store(&mem[REG(reg) + i], data[i]);
 				} else {
 #ifdef __aarch64__
 					if (dma) {
-						if (base == FSI_MASTER_ASPEED_ADDR) {
+						if (space == SPACE_CFAM) {
 							atomic_store(&fsi[REG(reg) + i], data[i]);
-							rc = check_errors(ctrl);
+							rc = dma_check_errors(ctrl, mem, link);
 						}
 						else {
 							atomic_store(&ctrl[REG(reg) + i], data[i]);
@@ -632,20 +727,24 @@ int main(int argc, char **argv)
 					}
 					else
 #endif
-					rc = fsi_master_aspeed_write(mem, base + reg + (i * 4), data[i]);
-					if (rc)
+					rc = fsi_master_aspeed_write(mem, base + reg + (i * 4),
+								     data[i]);
+					if (rc) {
+						if (space == SPACE_CFAM)
+							check_errors(mem, link);
 						goto undo;
+					}
 				}
 			} else {
-				if (base == 0) {
+				if (space == SPACE_ASPEED) {
 					data[0] = atomic_load(&mem[REG(reg) + i]);
 					printf("FSIM%03x: %08x\n", reg + (i * 4), data[0]);
 				} else {
 #ifdef __aarch64__
 					if (dma) {
-						if (base == FSI_MASTER_ASPEED_ADDR) {
+						if (space == SPACE_CFAM) {
 							data[0] = atomic_load(&fsi[REG(reg) + i]);
-							rc = check_errors(ctrl);
+							rc = dma_check_errors(ctrl, mem, link);
 						}
 						else {
 							data[0] = atomic_load(&ctrl[REG(reg) + i]);
@@ -654,11 +753,17 @@ int main(int argc, char **argv)
 					}
 					else
 #endif
-					rc = fsi_master_aspeed_read(mem, base + reg + (i * 4), data);
-					if (rc)
+					rc = fsi_master_aspeed_read(mem, base + reg + (i * 4),
+								    data);
+					if (rc) {
+						if (space == SPACE_CFAM)
+							check_errors(mem, link);
 						goto undo;
+					}
 
-					printf("%s%03x: %08x\n", base == FSI_MASTER_ASPEED_ADDR ? "CFAM" : "MFSI", reg + (i * 4), data[0]);
+					printf("%s%03x: %08x\n",
+					       space == SPACE_CFAM ? "CFAM" : "MFSI",
+					       reg + (i * 4), data[0]);
 				}
 			}
 		}
@@ -667,15 +772,11 @@ int main(int argc, char **argv)
 undo:
 #ifdef __aarch64__
 	if (dma) {
-		write32(mem, OPB_RETRY_COUNTER, 0x000c0010);
+		write32(mem, OPB_RETRY_COUNTER, opbrc);
 		write32(mem, OPB_CTRL_BASE, FSI_MASTER_ASPEED_CTRL_ADDR);
 		write32(mem, OPB_FSI_BASE, FSI_MASTER_ASPEED_ADDR);
 	}
 #endif
-	if (opb1) {
-		write32(mem, OPB1_SELECT, 0);
-		write32(mem, OPB0_SELECT, 1);
-	}
 
 done:
 	if (data != &_data)
