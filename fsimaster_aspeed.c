@@ -46,6 +46,7 @@
 #define OPB0_XFER_SIZE		0x18
 #define OPB0_FSI_ADDR		0x1c
 #define OPB0_FSI_DATA_W		0x20
+#define OPB1_DMA_ENABLE		0x24
 #define OPB1_SELECT		0x28
 #define OPB1_RW			0x2c
 #define OPB1_XFER_SIZE		0x30
@@ -56,6 +57,7 @@
 #define OPB_IRQ_STATUS		0x48
 #define  OPB0_XFER_ACK_EN 	 0x00010000
 #define  OPB1_XFER_ACK_EN	 0x00020000
+#define  OPB_DMA_IRQ_EN		 0xffff
 #define OPB1_WRITE_ORDER1	0x54
 #define OPB1_WRITE_ORDER2	0x58
 #define OPB1_READ_ORDER		0x60
@@ -65,6 +67,9 @@
 #define OPB0_FSI_DATA_R		0x84
 #define OPB1_STATUS		0x8c
 #define OPB1_FSI_DATA_R		0x90
+#define DMA_CHAN0_ADDR		0xc4
+#define DMA_CHAN0_CTRL		0xc8
+#define DMA_FUNC_EN		0xe4
 
 #define REG(x)			((x) / sizeof(uint32_t))
 
@@ -165,6 +170,7 @@ static int dma = 0;
 #endif
 static int opb1 = 0;
 static int verbose = 0;
+static int page_size = 0;
 
 #define vprintf(...)			\
 ({					\
@@ -232,18 +238,21 @@ int fsi_master_aspeed_xfer_ackd(volatile uint32_t *mem)
 		if (i)
 			nanosleep(&slp, &rem);
 
-		status = read32(mem, OPB_IRQ_STATUS);
+		status = atomic_load(&mem[REG(OPB_IRQ_STATUS)]);
 
 		timespec_get(&end, TIME_UTC);
 		diff_timespec(&start, &end, &df);
 		if (df.tv_sec > 0) {
-			printf("Timed out status:%08x [%d]\n", status, i);
+			uint32_t opb_status = read32(mem, opb1 ? OPB1_STATUS : OPB0_STATUS);
+
+			printf("Timed out irq status:%08x opb status:%08x [%d]\n", status, opb_status, i);
 			return -ETIMEDOUT;
 		}
 
 		++i;
 	} while (!(status & bit));
 
+	vprintf("read32[%02x]:%08x\n", OPB_IRQ_STATUS, status);
 	return 0;
 }
 
@@ -256,6 +265,10 @@ int fsi_master_aspeed_read(volatile uint32_t *mem, uint32_t reg, uint32_t *val)
 	write32(mem, opb1 ? OPB1_XFER_SIZE : OPB0_XFER_SIZE, XFER_FULLWORD);
 	write32(mem, opb1 ? OPB1_FSI_ADDR : OPB0_FSI_ADDR, reg);
 	write32(mem, OPB_IRQ_CLEAR, 1);
+
+	if (opb1)
+		write32(mem, DMA_FUNC_EN, 0x1);
+
 	write32(mem, OPB_TRIGGER, 1);
 
 	rc = fsi_master_aspeed_xfer_ackd(mem);
@@ -283,6 +296,10 @@ int fsi_master_aspeed_write(volatile uint32_t *mem, uint32_t reg, uint32_t val)
 	write32(mem, opb1 ? OPB1_FSI_ADDR : OPB0_FSI_ADDR, reg);
 	write32(mem, opb1 ? OPB1_FSI_DATA_W : OPB0_FSI_DATA_W, htobe32(val));
 	write32(mem, OPB_IRQ_CLEAR, 1);
+
+	if (opb1)
+		write32(mem, DMA_FUNC_EN, 0x1);
+
 	write32(mem, OPB_TRIGGER, 1);
 
 	rc = fsi_master_aspeed_xfer_ackd(mem);
@@ -370,9 +387,41 @@ void help()
 	printf("\t\t-v --verbose\n");
 }
 
+int get_physical_address(void *addr, uint32_t *phys)
+{
+	uint64_t pfn;
+	FILE *pm = fopen("/proc/self/pagemap", "rb");
+	uint32_t offset;
+
+	if (!pm) {
+		printf("failed to open pagemap\n");
+		return -1;
+	}
+
+	offset = (uint32_t)addr / page_size * 8;
+	if (fseek(pm, offset, SEEK_SET)) {
+		printf("failed to seek pagemap\n");
+		return -1;
+	}
+
+	if (fread(&pfn, 7, 1, pm) != 1) {
+		printf("failed to read pfn\n");
+		return -1;
+	}
+
+	printf("PFN:%016llx vaddr:%08x\n", pfn, (uint32_t)addr);
+
+	fclose(pm);
+	pfn &= 0x7FFFFFFFFFFFFF;
+	*phys = (uint32_t)((pfn << 12)) + ((uint32_t)addr % page_size);
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const struct reg *regs = NULL;
+	void *dma_addr = NULL;
 	volatile uint32_t *mem;
 #ifdef __aarch64__
 	volatile uint32_t *ctrl = NULL;
@@ -380,6 +429,7 @@ int main(int argc, char **argv)
 #endif
 	uint32_t _data = 0;
 	uint32_t *data = &_data;
+	uint32_t imask = 0;
 	uint32_t words = 1;
 	uint32_t link = 0;
 	uint32_t base = 0;
@@ -387,8 +437,11 @@ int main(int argc, char **argv)
 	uint32_t i = 1;
 	int write = 0;
 	int dump = 0;
+	int use_opb1 = 0;
 	int fd;
 	int rc;
+
+	page_size = getpagesize();
 
 	if (argc < 2) {
 		help();
@@ -440,7 +493,7 @@ int main(int argc, char **argv)
 			return -EINVAL;
 		}
 
-		opb1 = 1;
+		use_opb1 = 1;
 	}
 
 #ifdef __aarch64__
@@ -538,7 +591,7 @@ int main(int argc, char **argv)
 		goto done;
 	}
 
-	mem = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_MASTER_BASE);
+	mem = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_MASTER_BASE);
 	if (mem == MAP_FAILED) {
 		printf("Failed to mmap: %d - %s\n", errno, strerror(errno));
 		rc = -ENODEV;
@@ -548,7 +601,7 @@ int main(int argc, char **argv)
 #ifdef __aarch64__
 	if (dma) {
 		if (base) {
-			ctrl = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_CONTROL_BASE);
+			ctrl = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, FSI_CONTROL_BASE);
 			if (!ctrl) {
 				printf("Failed to mmap FSI master: %d - %s\n", errno, strerror(errno));
 				rc = -ENODEV;
@@ -570,14 +623,6 @@ int main(int argc, char **argv)
 		write32(mem, OPB_FSI_BASE, FSI_BASE);
 	}
 #endif
-
-	if (opb1) {
-		write32(mem, OPB1_READ_ORDER, 0x00030b1b);
-		write32(mem, OPB1_WRITE_ORDER1, 0x0011101b);
-		write32(mem, OPB1_WRITE_ORDER2, 0x0c330f3f);
-		write32(mem, OPB0_SELECT, 0);
-		write32(mem, OPB1_SELECT, 1);
-	}
 
 	if (dump) {
 		for (i = 0; i < words; ++i) {
@@ -612,8 +657,48 @@ int main(int argc, char **argv)
 #ifdef __aarch64__
 			}
 #endif
+
+			if (use_opb1) {
+				uint32_t phys;
+
+				dma_addr = malloc(page_size);
+				if (!dma_addr) {
+					rc = -ENOMEM;
+					printf("Failed to allocate a page for DMA\n");
+					goto proceed;
+				}
+
+				if (mlock(dma_addr, page_size)) {
+					rc = -ENOMEM;
+					printf("Failed to lock DMA page\n");
+					goto proceed;
+				}
+
+				if (get_physical_address(dma_addr, &phys)) {
+					rc = -ENOMEM;
+					goto proceed;
+				}
+
+				memset(dma_addr, 0, 4);
+
+				opb1 = 1;
+
+				imask = read32(mem, OPB_IRQ_MASK);
+
+				write32(mem, OPB_IRQ_MASK, imask | OPB_DMA_IRQ_EN);
+				write32(mem, OPB1_DMA_ENABLE, 0xf);
+				write32(mem, DMA_CHAN0_ADDR, phys);
+				write32(mem, DMA_CHAN0_CTRL, write ? 0x1 : 0x10001);
+
+				write32(mem, OPB1_READ_ORDER, 0x00030b1b);
+				write32(mem, OPB1_WRITE_ORDER1, 0x0011101b);
+				write32(mem, OPB1_WRITE_ORDER2, 0x0c330f3f);
+				write32(mem, OPB0_SELECT, 0);
+				write32(mem, OPB1_SELECT, 1);
+			}
 		}
 
+proceed:
 		for (i = 0; i < words; ++i) {
 			if (write) {
 				if (base == 0) {
@@ -673,11 +758,17 @@ undo:
 	}
 #endif
 	if (opb1) {
+		printf("result dma %08x\n", *(uint32_t *)dma_addr);
+
+		write32(mem, OPB_IRQ_MASK, imask);
 		write32(mem, OPB1_SELECT, 0);
 		write32(mem, OPB0_SELECT, 1);
 	}
 
 done:
+	if (dma_addr)
+		free(dma_addr);
+
 	if (data != &_data)
 		free(data);
 
