@@ -643,6 +643,9 @@ int main(int argc, char **argv)
 		irq_enabled = 1;
 
 #ifdef __aarch64__
+	if (space == SPACE_MASTER && !(opbrc & 0x40000))
+		dma = 1;
+
 	if (dma) {
 		if (space != SPACE_ASPEED) {
 			ctrl = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
