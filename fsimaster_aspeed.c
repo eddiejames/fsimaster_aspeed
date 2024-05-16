@@ -639,8 +639,6 @@ int main(int argc, char **argv)
 				rc = -ENODEV;
 				goto done;
 			}
-
-			write32(mem, OPB_CTRL_BASE, FSI_CONTROL_BASE);
 		}
 	}
 #endif
@@ -657,7 +655,7 @@ int main(int argc, char **argv)
 #endif
 				rc = fsi_master_aspeed_read(mem, base + regs[i].reg, data);
 				if (rc)
-					goto undo;
+					goto done;
 #ifdef __aarch64__
 				}
 #endif
@@ -674,7 +672,7 @@ int main(int argc, char **argv)
 #endif
 			rc = link_enable(mem, link);
 			if (rc)
-				goto undo;
+				goto done;
 
 			base += link * 0x80000;
 #ifdef __aarch64__
@@ -705,7 +703,7 @@ int main(int argc, char **argv)
 #endif
 							check_errors(mem, link);
 						}
-						goto undo;
+						goto done;
 					}
 #ifdef __aarch64__
 					}
@@ -734,7 +732,7 @@ int main(int argc, char **argv)
 #endif
 							check_errors(mem, link);
 						}
-						goto undo;
+						goto done;
 					}
 
 					printf("%s%03x: %08x\n",
@@ -747,12 +745,6 @@ int main(int argc, char **argv)
 			}
 		}
 	}
-
-undo:
-#ifdef __aarch64__
-	if (ctrldma)
-		write32(mem, OPB_CTRL_BASE, FSI_MASTER_ASPEED_CTRL_ADDR);
-#endif
 
 done:
 	if (data != &_data)
