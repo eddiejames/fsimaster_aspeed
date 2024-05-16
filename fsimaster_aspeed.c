@@ -171,9 +171,6 @@ static const struct reg mfsi_regs[] = {
 	{ "MECTRL", 0x2e0 }
 };
 
-#ifdef __aarch64__
-static int dma = 0;
-#endif
 static int verbose = 0;
 static int page_size = 0;
 static int irq_enabled = 0;
@@ -457,9 +454,6 @@ void help()
 	printf("\t\tdump\tread all registers of address space\n");
 	printf("\t\tmaster\tread/write FSI master space\n");
 	printf("\tOptions:\n");
-#ifdef __aarch64__
-	printf("\t\t-d --dma\n");
-#endif
 	printf("\t\t-l --link <link>\tFSI link to access\n");
 	printf("\t\t-n --num_words <count>\tnumber of words to read/write\n");
 	printf("\t\t-v --verbose\n");
@@ -471,7 +465,6 @@ int main(int argc, char **argv)
 	volatile uint32_t *mem;
 #ifdef __aarch64__
 	volatile uint32_t *ctrl = NULL;
-	volatile uint32_t *fsi = NULL;
 #endif
 	uint32_t _data = 0;
 	uint32_t *data = &_data;
@@ -482,6 +475,9 @@ int main(int argc, char **argv)
 	uint32_t reg = 0;
 	uint32_t i = 1;
 	int space = SPACE_ASPEED;
+#ifdef __aarch64__
+	int ctrldma = 0;
+#endif
 	int write = 0;
 	int dump = 0;
 	int fd;
@@ -531,18 +527,6 @@ int main(int argc, char **argv)
 			return -EINVAL;
 		}
 	}
-
-#ifdef __aarch64__
-	if (!strncmp(argv[i], "-d", 2) || !strncmp(argv[i], "--dma", 5)) {
-		++i;
-		if (i >= argc) {
-			help();
-			return -EINVAL;
-		}
-
-		dma = 1;
-	}
-#endif
 
 	if (!strncmp(argv[i], "-l", 2) || !strncmp(argv[i], "--link", 6)) {
 		++i;
@@ -643,10 +627,9 @@ int main(int argc, char **argv)
 		irq_enabled = 1;
 
 #ifdef __aarch64__
-	if (space == SPACE_MASTER && !(opbrc & 0x40000))
-		dma = 1;
+	if (!(opbrc & 0x40000)) {
+		ctrldma = 1;
 
-	if (dma) {
 		if (space != SPACE_ASPEED) {
 			ctrl = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
 				    FSI_CONTROL_BASE);
@@ -657,21 +640,8 @@ int main(int argc, char **argv)
 				goto done;
 			}
 
-			if (space == SPACE_CFAM) {
-				fsi = mmap(NULL, 14336, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
-					   FSI_BASE + (link * 0x80000));
-				if (!fsi) {
-					printf("Failed to mmap FSI: %d - %s\n", errno,
-					       strerror(errno));
-					rc = -ENODEV;
-					goto done;
-				}
-			}
+			write32(mem, OPB_CTRL_BASE, FSI_CONTROL_BASE);
 		}
-
-		write32(mem, OPB_RETRY_COUNTER, opbrc & ~0x000c0000);
-		write32(mem, OPB_CTRL_BASE, FSI_CONTROL_BASE);
-		write32(mem, OPB_FSI_BASE, FSI_BASE);
 	}
 #endif
 
@@ -681,7 +651,7 @@ int main(int argc, char **argv)
 				data[0] = atomic_load(&mem[REG(regs[i].reg)]);
 			} else {
 #ifdef __aarch64__
-				if (dma)
+				if (ctrldma)
 					data[0] = atomic_load(&ctrl[REG(regs[i].reg)]);
 				else {
 #endif
@@ -698,7 +668,7 @@ int main(int argc, char **argv)
 	} else {
 		if (space == SPACE_CFAM) {
 #ifdef __aarch64__
-			if (dma)
+			if (ctrldma)
 				dma_link_enable(ctrl, link);
 			else {
 #endif
@@ -718,25 +688,28 @@ int main(int argc, char **argv)
 					atomic_store(&mem[REG(reg) + i], data[i]);
 				} else {
 #ifdef __aarch64__
-					if (dma) {
-						if (space == SPACE_CFAM) {
-							atomic_store(&fsi[REG(reg) + i], data[i]);
-							rc = dma_check_errors(ctrl, mem, link);
-						}
-						else {
-							atomic_store(&ctrl[REG(reg) + i], data[i]);
-							rc = 0;
-						}
+					if (space == SPACE_MASTER && ctrldma) {
+						atomic_store(&ctrl[REG(reg) + i], data[i]);
+						rc = 0;
 					}
-					else
+					else {
 #endif
 					rc = fsi_master_aspeed_write(mem, base + reg + (i * 4),
 								     data[i]);
 					if (rc) {
-						if (space == SPACE_CFAM)
+						if (space == SPACE_CFAM) {
+#ifdef __aarch64__
+							if (ctrldma)
+								dma_check_errors(ctrl, mem, link);
+							else
+#endif
 							check_errors(mem, link);
+						}
 						goto undo;
 					}
+#ifdef __aarch64__
+					}
+#endif
 				}
 			} else {
 				if (space == SPACE_ASPEED) {
@@ -744,29 +717,32 @@ int main(int argc, char **argv)
 					printf("FSIM%03x: %08x\n", reg + (i * 4), data[0]);
 				} else {
 #ifdef __aarch64__
-					if (dma) {
-						if (space == SPACE_CFAM) {
-							data[0] = atomic_load(&fsi[REG(reg) + i]);
-							rc = dma_check_errors(ctrl, mem, link);
-						}
-						else {
-							data[0] = atomic_load(&ctrl[REG(reg) + i]);
-							rc = 0;
-						}
+					if (space == SPACE_MASTER && ctrldma) {
+						data[0] = atomic_load(&ctrl[REG(reg) + i]);
+						rc = 0;
 					}
-					else
+					else {
 #endif
 					rc = fsi_master_aspeed_read(mem, base + reg + (i * 4),
 								    data);
 					if (rc) {
-						if (space == SPACE_CFAM)
+						if (space == SPACE_CFAM) {
+#ifdef __aarch64__
+							if (ctrldma)
+								dma_check_errors(ctrl, mem, link);
+							else
+#endif
 							check_errors(mem, link);
+						}
 						goto undo;
 					}
 
 					printf("%s%03x: %08x\n",
 					       space == SPACE_CFAM ? "CFAM" : "MFSI",
 					       reg + (i * 4), data[0]);
+#ifdef __aarch64__
+					}
+#endif
 				}
 			}
 		}
@@ -774,11 +750,8 @@ int main(int argc, char **argv)
 
 undo:
 #ifdef __aarch64__
-	if (dma) {
-		write32(mem, OPB_RETRY_COUNTER, opbrc);
+	if (ctrldma)
 		write32(mem, OPB_CTRL_BASE, FSI_MASTER_ASPEED_CTRL_ADDR);
-		write32(mem, OPB_FSI_BASE, FSI_MASTER_ASPEED_ADDR);
-	}
 #endif
 
 done:
