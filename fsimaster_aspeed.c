@@ -58,8 +58,11 @@
 #define  OPB0_XFER_ACK_EN 	 0x00010000
 #define  OPB1_XFER_ACK_EN	 0x00020000
 #define  OPB_DMA_IRQ_EN		 0xffff
+#define OPB0_WRITE_ORDER1	0x4c
+#define OPB0_WRITE_ORDER2	0x50
 #define OPB1_WRITE_ORDER1	0x54
 #define OPB1_WRITE_ORDER2	0x58
+#define OPB0_READ_ORDER		0x5c
 #define OPB1_READ_ORDER		0x60
 #define OPB_RETRY_COUNTER	0x64
 #define OPB0_STATUS		0x80
@@ -171,6 +174,7 @@ static const struct reg mfsi_regs[] = {
 	{ "MECTRL", 0x2e0 }
 };
 
+static int byteswap = 0;
 static int verbose = 0;
 static int page_size = 0;
 static int irq_enabled = 0;
@@ -288,7 +292,10 @@ int fsi_master_aspeed_read(volatile uint32_t *mem, uint32_t reg, uint32_t *val)
 		return -EIO;
 	}
 
-	*val = be32toh(read32(mem, OPB0_FSI_DATA_R));
+	if (byteswap)
+		*val = read32(mem, OPB0_FSI_DATA_R);
+	else
+		*val = be32toh(read32(mem, OPB0_FSI_DATA_R));
 
 	return 0;
 }
@@ -301,7 +308,7 @@ int fsi_master_aspeed_write(volatile uint32_t *mem, uint32_t reg, uint32_t val)
 	write32(mem, OPB0_RW, CMD_WRITE);
 	write32(mem, OPB0_XFER_SIZE, XFER_FULLWORD);
 	write32(mem, OPB0_FSI_ADDR, reg);
-	write32(mem, OPB0_FSI_DATA_W, htobe32(val));
+	write32(mem, OPB0_FSI_DATA_W, byteswap ? val : htobe32(val));
 	if (irq_enabled)
 		write32(mem, OPB_IRQ_STATUS, 0);
 	else
@@ -457,12 +464,13 @@ void help()
 	printf("\t\t-l --link <link>\tFSI link to access\n");
 	printf("\t\t-n --num_words <count>\tnumber of words to read/write\n");
 	printf("\t\t-v --verbose\n");
+	printf("\t\t-b --byteswap\ttry hardware byte swapping on opb\n");
 }
 
 int main(int argc, char **argv)
 {
 	const struct reg *regs = NULL;
-	volatile uint32_t *mem;
+	volatile uint32_t *mem = NULL;
 #ifdef __aarch64__
 	volatile uint32_t *ctrl = NULL;
 #endif
@@ -473,6 +481,9 @@ int main(int argc, char **argv)
 	uint32_t link = 0;
 	uint32_t base = 0;
 	uint32_t reg = 0;
+	uint32_t rdbo = 0;
+	uint32_t wdbo1 = 0;
+	uint32_t wdbo2 = 0;
 	uint32_t i = 1;
 	int space = SPACE_ASPEED;
 #ifdef __aarch64__
@@ -544,6 +555,16 @@ int main(int argc, char **argv)
 			help();
 			return -EINVAL;
 		}
+	}
+
+	if (!strncmp(argv[i], "-b", 2) || !strncmp(argv[i], "--byteswap", 10)) {
+		++i;
+		if (i >= argc) {
+			help();
+			return -EINVAL;
+		}
+
+		byteswap = 1;
 	}
 
 	if (!strncmp(argv[i], "cfam", 4)) {
@@ -642,6 +663,18 @@ int main(int argc, char **argv)
 		}
 	}
 #endif
+
+	if (byteswap && space != SPACE_ASPEED) {
+		byteswap = 2;
+
+		rdbo = read32(mem, OPB0_READ_ORDER);
+		wdbo1 = read32(mem, OPB0_WRITE_ORDER1);
+		wdbo2 = read32(mem, OPB0_WRITE_ORDER2);
+
+		write32(mem, OPB0_READ_ORDER, 0x0044eee4);
+		write32(mem, OPB0_WRITE_ORDER1, 0x0044eee4);
+		write32(mem, OPB0_WRITE_ORDER2, 0x0055aaff);
+	}
 
 	if (dump) {
 		for (i = 0; i < words; ++i) {
@@ -747,6 +780,12 @@ int main(int argc, char **argv)
 	}
 
 done:
+	if (byteswap == 2) {
+		write32(mem, OPB0_READ_ORDER, rdbo);
+		write32(mem, OPB0_WRITE_ORDER1, wdbo1);
+		write32(mem, OPB0_WRITE_ORDER2, wdbo2);
+	}
+
 	if (data != &_data)
 		free(data);
 
